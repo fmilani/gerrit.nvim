@@ -201,9 +201,9 @@ local pick_change = function()
 			{ width = 1 },
 			{ width = 7 },
 			{ width = 1 },
-			{ width = 28 },
+			{ width = 48 },
 			{ width = 1 },
-			{ remaining = true },
+			{ width = 24 },
 		},
 	})
 
@@ -226,9 +226,9 @@ local pick_change = function()
 								{ "|", "Comment" },
 								tostring(entry.number),
 								{ "|", "Comment" },
-								entry.project,
-								{ "|", "Comment" },
 								entry.subject,
+								{ "|", "Comment" },
+								entry.project,
 							})
 						end,
 						ordinal = entry.subject,
