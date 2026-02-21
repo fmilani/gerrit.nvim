@@ -1,6 +1,7 @@
 local M = {}
 
 local highlights_defined = false
+local diff_ref_cache = {}
 
 local config = {
 	host = "",
@@ -43,6 +44,93 @@ local run_cmd = function(args)
 	end
 
 	return result.stdout
+end
+
+local function change_ref(change)
+	local patchset = change.currentPatchSet
+	if not patchset then
+		return nil
+	end
+
+	if patchset.ref and patchset.ref ~= "" then
+		return patchset.ref
+	end
+
+	if not patchset.number then
+		return nil
+	end
+
+	local two_digits = string.format("%02d", tonumber(change.number) % 100)
+	return string.format("refs/changes/%s/%s/%s", two_digits, change.number, patchset.number)
+end
+
+local function cache_key(change)
+	local patchset = change.currentPatchSet or {}
+	local revision = patchset.revision or ""
+	return table.concat({ change.project or "", tostring(change.number or ""), tostring(patchset.number or ""), revision }, "|")
+end
+
+local function sanitize_ref_component(value)
+	return tostring(value):gsub("[^%w%._%-%/]", "-")
+end
+
+local function local_diff_ref(change)
+	local patchset = change.currentPatchSet or {}
+	return string.format(
+		"refs/gerrit-nvim/%s/%s/%s",
+		sanitize_ref_component(change.project or "unknown"),
+		sanitize_ref_component(change.number or "unknown"),
+		sanitize_ref_component(patchset.number or "latest")
+	)
+end
+
+local function has_local_ref(ref)
+	local check = vim.system({ "git", "rev-parse", "--verify", "--quiet", ref .. "^{commit}" }, { text = true }):wait()
+	return check.code == 0
+end
+
+local function open_change_diff(change)
+	ensure_required_config()
+
+	local ref = change_ref(change)
+	if not ref then
+		vim.notify("gerrit.nvim: missing patchset ref", vim.log.levels.ERROR)
+		return
+	end
+
+	local key = cache_key(change)
+	local target_ref = diff_ref_cache[key]
+	if not target_ref or not has_local_ref(target_ref) then
+		target_ref = local_diff_ref(change)
+		local remote = string.format("ssh://%s@%s:%s/%s", config.user, config.host, config.port, change.project)
+		local refspec = string.format("+%s:%s", ref, target_ref)
+		local fetch = vim.system({ "git", "fetch", "--quiet", remote, refspec }, { text = true }):wait()
+		if fetch.code ~= 0 then
+			vim.notify(fetch.stderr or "gerrit.nvim: git fetch failed", vim.log.levels.ERROR)
+			return
+		end
+		diff_ref_cache[key] = target_ref
+	end
+
+	local show = vim.system({ "git", "show", "--no-color", target_ref }, { text = true }):wait()
+	if show.code ~= 0 then
+		vim.notify(show.stderr or "gerrit.nvim: git show failed", vim.log.levels.ERROR)
+		return
+	end
+
+	vim.cmd("tabnew")
+	local buf = vim.api.nvim_create_buf(true, true)
+	vim.api.nvim_set_current_buf(buf)
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].bufhidden = "wipe"
+	vim.bo[buf].swapfile = false
+	vim.bo[buf].filetype = "diff"
+
+	local lines = vim.split(show.stdout, "\n", { plain = true })
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.bo[buf].modifiable = false
+	local patchset_number = change.currentPatchSet and change.currentPatchSet.number or "latest"
+	vim.api.nvim_buf_set_name(buf, string.format("gerrit://%s/%s.diff", tostring(change.number), tostring(patchset_number)))
 end
 
 local open_changes = function()
@@ -243,8 +331,16 @@ local pick_change = function()
 					actions.close(prompt_bufnr)
 					local selection = action_state.get_selected_entry()
 					local change = selection.value
-					vim.ui.open(string.format("%s/c/%s/+/%s", config.host, change.project, change.number))
+					open_change_diff(change)
 				end)
+
+				vim.keymap.set({ "i", "n" }, "<C-o>", function()
+					local selection = action_state.get_selected_entry()
+					if not selection or not selection.value then
+						return
+					end
+					vim.ui.open(string.format("%s/c/%s/+/%s", config.host, selection.value.project, selection.value.number))
+				end, { buffer = prompt_bufnr })
 
 				return true
 			end,
