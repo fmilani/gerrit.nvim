@@ -11,6 +11,17 @@ local config = {
 	port = 29418,
 }
 
+local PICKER_VIEWS = {
+	incoming = {
+		title = "Gerrit Incoming Reviews",
+		query = "is:open ((reviewer:self NOT owner:self NOT is:ignored) OR assignee:self) NOT is:wip",
+	},
+	outgoing = {
+		title = "Gerrit Outgoing Reviews",
+		query = "is:open owner:self NOT is:wip",
+	},
+}
+
 local function ensure_required_config()
 	if not config.host or vim.trim(config.host) == "" then
 		error(
@@ -169,7 +180,10 @@ local function add_inline_comment_from_cursor(buf)
 			return
 		end
 		add_or_update_inline_comment(buf, line_nr, message)
-		vim.notify(existing_message and "gerrit.nvim: inline comment updated" or "gerrit.nvim: inline comment added", vim.log.levels.INFO)
+		vim.notify(
+			existing_message and "gerrit.nvim: inline comment updated" or "gerrit.nvim: inline comment added",
+			vim.log.levels.INFO
+		)
 	end)
 end
 
@@ -248,7 +262,8 @@ local function submit_comments_from_buffer(buf, code_review_vote)
 		store[id] = nil
 	end
 
-	local vote_msg = code_review_vote ~= nil and string.format("CR %s", code_review_vote > 0 and ("+" .. code_review_vote) or tostring(code_review_vote))
+	local vote_msg = code_review_vote ~= nil
+			and string.format("CR %s", code_review_vote > 0 and ("+" .. code_review_vote) or tostring(code_review_vote))
 		or "no vote"
 	vim.notify(string.format("gerrit.nvim: submitted %d comment(s), %s", total, vote_msg), vim.log.levels.INFO)
 end
@@ -337,7 +352,10 @@ end
 local function cache_key(change)
 	local patchset = change.currentPatchSet or {}
 	local revision = patchset.revision or ""
-	return table.concat({ change.project or "", tostring(change.number or ""), tostring(patchset.number or ""), revision }, "|")
+	return table.concat(
+		{ change.project or "", tostring(change.number or ""), tostring(patchset.number or ""), revision },
+		"|"
+	)
 end
 
 local function sanitize_ref_component(value)
@@ -402,7 +420,10 @@ local function open_change_diff(change)
 	vim.bo[buf].readonly = true
 	reset_comment_store(buf)
 	local patchset_number = change.currentPatchSet and change.currentPatchSet.number or "latest"
-	vim.api.nvim_buf_set_name(buf, string.format("gerrit://%s/%s.diff", tostring(change.number), tostring(patchset_number)))
+	vim.api.nvim_buf_set_name(
+		buf,
+		string.format("gerrit://%s/%s.diff", tostring(change.number), tostring(patchset_number))
+	)
 	vim.b[buf].gerrit_revision = change.currentPatchSet and change.currentPatchSet.revision or ""
 	vim.b[buf].gerrit_review_view = true
 	vim.keymap.set("n", "gc", function()
@@ -420,11 +441,11 @@ local function open_change_diff(change)
 	vim.notify("gerrit.nvim: gc add/edit comment, gC clear, gr review, gs submit", vim.log.levels.INFO)
 end
 
-local open_changes = function()
+local open_changes = function(query)
 	local output = run_cmd({
 		"gerrit",
 		"query",
-		"is:open ((reviewer:self NOT owner:self NOT is:ignored) OR assignee:self) NOT is:wip",
+		query,
 		"--current-patch-set",
 		"--format=JSON",
 	})
@@ -561,10 +582,14 @@ local function ensure_highlights()
 	highlights_defined = true
 end
 
-local pick_change = function()
+local pick_change
+pick_change = function(view_name)
+	view_name = view_name or "incoming"
+	local view = PICKER_VIEWS[view_name] or PICKER_VIEWS.incoming
+
 	ensure_highlights()
 	print("Loading changes...")
-	local changes = open_changes()
+	local changes = open_changes(view.query)
 	print("")
 	local displayer = entry_display.create({
 		separator = " ",
@@ -584,7 +609,7 @@ local pick_change = function()
 
 	pickers
 		.new({}, {
-			prompt_title = "Gerrit Open Changes",
+			prompt_title = view.title,
 
 			finder = finders.new_table({
 				results = changes,
@@ -613,7 +638,9 @@ local pick_change = function()
 
 			sorter = conf.generic_sorter({}),
 
-			attach_mappings = function(prompt_bufnr)
+			attach_mappings = function(prompt_bufnr, map)
+				local target_view = view_name == "incoming" and "outgoing" or "incoming"
+
 				actions.select_default:replace(function()
 					actions.close(prompt_bufnr)
 					local selection = action_state.get_selected_entry()
@@ -621,12 +648,21 @@ local pick_change = function()
 					open_change_diff(change)
 				end)
 
+				map({ "i", "n" }, "<C-v>", function()
+					actions.close(prompt_bufnr)
+					vim.schedule(function()
+						pick_change(target_view)
+					end)
+				end)
+
 				vim.keymap.set({ "i", "n" }, "<C-o>", function()
 					local selection = action_state.get_selected_entry()
 					if not selection or not selection.value then
 						return
 					end
-					vim.ui.open(string.format("%s/c/%s/+/%s", config.host, selection.value.project, selection.value.number))
+					vim.ui.open(
+						string.format("%s/c/%s/+/%s", config.host, selection.value.project, selection.value.number)
+					)
 				end, { buffer = prompt_bufnr })
 
 				return true
@@ -639,7 +675,12 @@ vim.api.nvim_create_user_command("Gerrit", function(opts)
 	local fargs = opts.fargs or {}
 	local subcommand = fargs[1] and vim.trim(fargs[1]) or ""
 	if subcommand == "" then
-		pick_change()
+		pick_change("incoming")
+		return
+	end
+
+	if subcommand == "outgoing" then
+		pick_change("outgoing")
 		return
 	end
 
@@ -670,7 +711,7 @@ end, {
 		if cmdline:match("^%s*Gerrit%s+review%s+") then
 			return { "0", "-2", "-1", "+1", "+2" }
 		end
-		return { "review", "submit" }
+		return { "outgoing", "review", "submit" }
 	end,
 })
 
