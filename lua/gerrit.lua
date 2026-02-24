@@ -2,6 +2,8 @@ local M = {}
 
 local highlights_defined = false
 local diff_ref_cache = {}
+local comment_ns = vim.api.nvim_create_namespace("gerrit.nvim.comments")
+local comment_store_by_buf = {}
 
 local config = {
 	host = "",
@@ -25,7 +27,7 @@ M.setup = function(opts)
 	config = vim.tbl_deep_extend("force", config, opts or {})
 end
 
-local run_cmd = function(args)
+local run_cmd = function(args, stdin)
 	ensure_required_config()
 	local ssh_target = string.format("%s@%s", config.user, config.host)
 
@@ -37,13 +39,270 @@ local run_cmd = function(args)
 		ssh_target,
 	}
 	vim.list_extend(cmd, args)
-	local result = vim.system(cmd, { text = true }):wait()
+	local result = vim.system(cmd, { text = true, stdin = stdin }):wait()
 
 	if result.code ~= 0 then
 		error(result.stderr)
 	end
 
 	return result.stdout
+end
+
+local function get_comment_store(buf)
+	if not comment_store_by_buf[buf] then
+		comment_store_by_buf[buf] = {}
+	end
+	return comment_store_by_buf[buf]
+end
+
+local function reset_comment_store(buf)
+	comment_store_by_buf[buf] = {}
+	vim.api.nvim_buf_clear_namespace(buf, comment_ns, 0, -1)
+end
+
+local function add_or_update_inline_comment(buf, line_nr, message)
+	local store = get_comment_store(buf)
+	local existing_marks = vim.api.nvim_buf_get_extmarks(buf, comment_ns, { line_nr - 1, 0 }, { line_nr - 1, -1 }, {})
+	for _, mark in ipairs(existing_marks) do
+		vim.api.nvim_buf_del_extmark(buf, comment_ns, mark[1])
+		store[mark[1]] = nil
+	end
+
+	local id = vim.api.nvim_buf_set_extmark(buf, comment_ns, line_nr - 1, 0, {
+		virt_lines = {
+			{ { ">> " .. message, "Comment" } },
+		},
+		virt_lines_above = false,
+	})
+	store[id] = message
+end
+
+local function clear_inline_comment(buf, line_nr)
+	local store = get_comment_store(buf)
+	local marks = vim.api.nvim_buf_get_extmarks(buf, comment_ns, { line_nr - 1, 0 }, { line_nr - 1, -1 }, {})
+	local removed = false
+	for _, mark in ipairs(marks) do
+		removed = true
+		vim.api.nvim_buf_del_extmark(buf, comment_ns, mark[1])
+		store[mark[1]] = nil
+	end
+	return removed
+end
+
+local function inline_comment_on_line(buf, line_nr)
+	local store = get_comment_store(buf)
+	local marks = vim.api.nvim_buf_get_extmarks(buf, comment_ns, { line_nr - 1, 0 }, { line_nr - 1, -1 }, {})
+	if #marks == 0 then
+		return nil, nil
+	end
+
+	local id = marks[1][1]
+	return id, store[id]
+end
+
+local function build_diff_line_map(lines)
+	local line_map = {}
+	local current_file = nil
+	local old_line = nil
+	local new_line = nil
+
+	for idx, line in ipairs(lines) do
+		local hunk_old, hunk_new = line:match("^@@ %-(%d+),?%d* %+(%d+),?%d* @@")
+		if hunk_old and hunk_new then
+			old_line = tonumber(hunk_old)
+			new_line = tonumber(hunk_new)
+		elseif line:match("^diff %-%-git ") then
+			current_file = nil
+			old_line = nil
+			new_line = nil
+		else
+			local next_file = line:match("^%+%+%+ b/(.+)$")
+			if next_file then
+				current_file = next_file
+			elseif line == "+++ /dev/null" then
+				current_file = nil
+			elseif old_line and new_line then
+				local prefix = line:sub(1, 1)
+				if prefix == "+" and not line:match("^%+%+%+") then
+					line_map[idx] = { path = current_file, line = new_line }
+					new_line = new_line + 1
+				elseif prefix == " " then
+					line_map[idx] = { path = current_file, line = new_line }
+					old_line = old_line + 1
+					new_line = new_line + 1
+				elseif prefix == "-" and not line:match("^%-%-%-") then
+					old_line = old_line + 1
+				end
+			end
+		end
+	end
+
+	return line_map
+end
+
+local function add_inline_comment_from_cursor(buf)
+	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+	local line_map = build_diff_line_map(lines)
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local line_nr = cursor[1]
+	local anchor = line_map[line_nr]
+
+	if not anchor or not anchor.path or not anchor.line then
+		vim.notify("gerrit.nvim: place cursor on an added/context diff line", vim.log.levels.WARN)
+		return
+	end
+
+	local _, existing_message = inline_comment_on_line(buf, line_nr)
+	vim.ui.input({
+		prompt = existing_message and "Edit inline comment: " or "Inline comment: ",
+		default = existing_message or "",
+	}, function(input)
+		if input == nil then
+			return
+		end
+		local message = vim.trim(input)
+		if message == "" then
+			if existing_message then
+				clear_inline_comment(buf, line_nr)
+				vim.notify("gerrit.nvim: inline comment cleared", vim.log.levels.INFO)
+			end
+			return
+		end
+		add_or_update_inline_comment(buf, line_nr, message)
+		vim.notify(existing_message and "gerrit.nvim: inline comment updated" or "gerrit.nvim: inline comment added", vim.log.levels.INFO)
+	end)
+end
+
+local function clear_inline_comment_from_cursor(buf)
+	local line_nr = vim.api.nvim_win_get_cursor(0)[1]
+	if clear_inline_comment(buf, line_nr) then
+		vim.notify("gerrit.nvim: inline comment cleared", vim.log.levels.INFO)
+	else
+		vim.notify("gerrit.nvim: no inline comment on this line", vim.log.levels.WARN)
+	end
+end
+
+local function submit_comments_from_buffer(buf, code_review_vote)
+	local revision = vim.b[buf].gerrit_revision
+	if not revision or revision == "" then
+		vim.notify("gerrit.nvim: current buffer has no Gerrit revision metadata", vim.log.levels.ERROR)
+		return
+	end
+
+	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+	local line_map = build_diff_line_map(lines)
+	local store = get_comment_store(buf)
+	local extmarks = vim.api.nvim_buf_get_extmarks(buf, comment_ns, 0, -1, {})
+	local comments = {}
+	local unresolved = 0
+	local resolved_mark_ids = {}
+	local total = 0
+
+	for _, mark in ipairs(extmarks) do
+		local id = mark[1]
+		local row = mark[2]
+		local message = store[id]
+		if message and message ~= "" then
+			local anchor = line_map[row + 1]
+			if anchor and anchor.path and anchor.line then
+				comments[anchor.path] = comments[anchor.path] or {}
+				table.insert(comments[anchor.path], {
+					line = anchor.line,
+					message = message,
+				})
+				table.insert(resolved_mark_ids, id)
+				total = total + 1
+			else
+				unresolved = unresolved + 1
+			end
+		end
+	end
+
+	if unresolved > 0 then
+		vim.notify(
+			string.format("gerrit.nvim: %d comment(s) could not be mapped to a diff line", unresolved),
+			vim.log.levels.WARN
+		)
+	end
+
+	local payload_table = {}
+	if total > 0 then
+		payload_table.comments = comments
+	end
+	if code_review_vote ~= nil then
+		payload_table.labels = {
+			["Code-Review"] = code_review_vote,
+		}
+	end
+
+	if payload_table.comments == nil and payload_table.labels == nil then
+		vim.notify("gerrit.nvim: nothing to submit", vim.log.levels.WARN)
+		return
+	end
+
+	local payload = vim.json.encode(payload_table)
+	run_cmd({ "gerrit", "review", "--json", revision }, payload)
+
+	for _, id in ipairs(resolved_mark_ids) do
+		vim.api.nvim_buf_del_extmark(buf, comment_ns, id)
+		store[id] = nil
+	end
+
+	local vote_msg = code_review_vote ~= nil and string.format("CR %s", code_review_vote > 0 and ("+" .. code_review_vote) or tostring(code_review_vote))
+		or "no vote"
+	vim.notify(string.format("gerrit.nvim: submitted %d comment(s), %s", total, vote_msg), vim.log.levels.INFO)
+
+	if vim.b[buf].gerrit_review_view then
+		local wins = vim.fn.win_findbuf(buf)
+		if #wins > 0 and vim.api.nvim_win_is_valid(wins[1]) then
+			vim.api.nvim_win_close(wins[1], false)
+		end
+	end
+end
+
+local function submit_with_vote_prompt(buf)
+	local options = {
+		{ label = "0", vote = 0 },
+		{ label = "-2", vote = -2 },
+		{ label = "-1", vote = -1 },
+		{ label = "+1", vote = 1 },
+		{ label = "+2", vote = 2 },
+	}
+
+	vim.ui.select(options, {
+		prompt = "Code-Review vote:",
+		format_item = function(item)
+			return item.label
+		end,
+	}, function(choice)
+		if not choice then
+			return
+		end
+		submit_comments_from_buffer(buf, choice.vote)
+	end)
+end
+
+local function parse_code_review_vote(token)
+	if token == nil or token == "" then
+		return true, nil
+	end
+
+	local map = {
+		["0"] = 0,
+		["-2"] = -2,
+		["-1"] = -1,
+		["+1"] = 1,
+		["1"] = 1,
+		["+2"] = 2,
+		["2"] = 2,
+	}
+
+	local vote = map[token]
+	if vote == nil then
+		return false, nil
+	end
+
+	return true, vote
 end
 
 local function change_ref(change)
@@ -129,8 +388,22 @@ local function open_change_diff(change)
 	local lines = vim.split(show.stdout, "\n", { plain = true })
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.bo[buf].modifiable = false
+	vim.bo[buf].readonly = true
+	reset_comment_store(buf)
 	local patchset_number = change.currentPatchSet and change.currentPatchSet.number or "latest"
 	vim.api.nvim_buf_set_name(buf, string.format("gerrit://%s/%s.diff", tostring(change.number), tostring(patchset_number)))
+	vim.b[buf].gerrit_revision = change.currentPatchSet and change.currentPatchSet.revision or ""
+	vim.b[buf].gerrit_review_view = true
+	vim.keymap.set("n", "gc", function()
+		add_inline_comment_from_cursor(buf)
+	end, { buffer = buf, silent = true, desc = "Add Gerrit inline comment" })
+	vim.keymap.set("n", "gC", function()
+		clear_inline_comment_from_cursor(buf)
+	end, { buffer = buf, silent = true, desc = "Clear Gerrit inline comment" })
+	vim.keymap.set("n", "gr", function()
+		submit_with_vote_prompt(buf)
+	end, { buffer = buf, silent = true, desc = "Send Gerrit review" })
+	vim.notify("gerrit.nvim: gc add/edit comment, gC clear, gr review", vim.log.levels.INFO)
 end
 
 local open_changes = function()
@@ -348,7 +621,38 @@ local pick_change = function()
 		:find()
 end
 
-vim.api.nvim_create_user_command("Gerrit", function()
-	pick_change()
-end, {})
+vim.api.nvim_create_user_command("Gerrit", function(opts)
+	local fargs = opts.fargs or {}
+	local subcommand = fargs[1] and vim.trim(fargs[1]) or ""
+	if subcommand == "" then
+		pick_change()
+		return
+	end
+
+	if subcommand == "review" then
+		local vote_token = fargs[2] and vim.trim(fargs[2]) or nil
+		if vote_token ~= nil and vote_token ~= "" then
+			local ok, vote = parse_code_review_vote(vote_token)
+			if not ok then
+				vim.notify("gerrit.nvim: invalid vote. Use 0, -2, -1, +1, +2", vim.log.levels.ERROR)
+				return
+			end
+			submit_comments_from_buffer(vim.api.nvim_get_current_buf(), vote)
+			return
+		end
+		submit_with_vote_prompt(vim.api.nvim_get_current_buf())
+		return
+	end
+
+	vim.notify("gerrit.nvim: unknown subcommand '" .. subcommand .. "'", vim.log.levels.ERROR)
+end, {
+	nargs = "*",
+	complete = function(_, cmdline)
+		if cmdline:match("^%s*Gerrit%s+review%s+") then
+			return { "0", "-2", "-1", "+1", "+2" }
+		end
+		return { "review" }
+	end,
+})
+
 return M
