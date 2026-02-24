@@ -251,13 +251,6 @@ local function submit_comments_from_buffer(buf, code_review_vote)
 	local vote_msg = code_review_vote ~= nil and string.format("CR %s", code_review_vote > 0 and ("+" .. code_review_vote) or tostring(code_review_vote))
 		or "no vote"
 	vim.notify(string.format("gerrit.nvim: submitted %d comment(s), %s", total, vote_msg), vim.log.levels.INFO)
-
-	if vim.b[buf].gerrit_review_view then
-		local wins = vim.fn.win_findbuf(buf)
-		if #wins > 0 and vim.api.nvim_win_is_valid(wins[1]) then
-			vim.api.nvim_win_close(wins[1], false)
-		end
-	end
 end
 
 local function submit_with_vote_prompt(buf)
@@ -280,6 +273,24 @@ local function submit_with_vote_prompt(buf)
 		end
 		submit_comments_from_buffer(buf, choice.vote)
 	end)
+end
+
+local function submit_change_from_buffer(buf)
+	local revision = vim.b[buf].gerrit_revision
+	if not revision or revision == "" then
+		vim.notify("gerrit.nvim: current buffer has no Gerrit revision metadata", vim.log.levels.ERROR)
+		return
+	end
+
+	run_cmd({ "gerrit", "review", "--submit", revision })
+	vim.notify("gerrit.nvim: change submitted", vim.log.levels.INFO)
+
+	if vim.b[buf].gerrit_review_view then
+		local wins = vim.fn.win_findbuf(buf)
+		if #wins > 0 and vim.api.nvim_win_is_valid(wins[1]) then
+			vim.api.nvim_win_close(wins[1], false)
+		end
+	end
 end
 
 local function parse_code_review_vote(token)
@@ -403,7 +414,10 @@ local function open_change_diff(change)
 	vim.keymap.set("n", "gr", function()
 		submit_with_vote_prompt(buf)
 	end, { buffer = buf, silent = true, desc = "Send Gerrit review" })
-	vim.notify("gerrit.nvim: gc add/edit comment, gC clear, gr review", vim.log.levels.INFO)
+	vim.keymap.set("n", "gs", function()
+		submit_change_from_buffer(buf)
+	end, { buffer = buf, silent = true, desc = "Submit Gerrit change" })
+	vim.notify("gerrit.nvim: gc add/edit comment, gC clear, gr review, gs submit", vim.log.levels.INFO)
 end
 
 local open_changes = function()
@@ -644,6 +658,11 @@ vim.api.nvim_create_user_command("Gerrit", function(opts)
 		return
 	end
 
+	if subcommand == "submit" then
+		submit_change_from_buffer(vim.api.nvim_get_current_buf())
+		return
+	end
+
 	vim.notify("gerrit.nvim: unknown subcommand '" .. subcommand .. "'", vim.log.levels.ERROR)
 end, {
 	nargs = "*",
@@ -651,7 +670,7 @@ end, {
 		if cmdline:match("^%s*Gerrit%s+review%s+") then
 			return { "0", "-2", "-1", "+1", "+2" }
 		end
-		return { "review" }
+		return { "review", "submit" }
 	end,
 })
 
